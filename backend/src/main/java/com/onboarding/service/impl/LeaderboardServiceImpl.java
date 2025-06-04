@@ -1,0 +1,204 @@
+package com.onboarding.service.impl;
+
+import com.onboarding.dto.LeaderboardDTO;
+import com.onboarding.model.Leaderboard;
+import com.onboarding.model.Module;
+import com.onboarding.model.User;
+import com.onboarding.model.UserQuiz;
+import com.onboarding.model.UserProgress;
+import com.onboarding.repository.LeaderboardRepository;
+import com.onboarding.repository.ModuleRepository;
+import com.onboarding.repository.UserQuizRepository;
+import com.onboarding.repository.UserProgressRepository;
+import com.onboarding.repository.UserRepository;
+import com.onboarding.service.LeaderboardService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Service
+public class LeaderboardServiceImpl implements LeaderboardService {
+
+    private final UserRepository userRepository;
+    private final UserProgressRepository userProgressRepository;
+    private final UserQuizRepository userQuizRepository;
+    private final ModuleRepository moduleRepository;
+    private final LeaderboardRepository leaderboardRepository;
+
+    @Autowired
+    public LeaderboardServiceImpl(
+            UserRepository userRepository,
+            UserProgressRepository userProgressRepository,
+            UserQuizRepository userQuizRepository,
+            ModuleRepository moduleRepository,
+            LeaderboardRepository leaderboardRepository) {
+        this.userRepository = userRepository;
+        this.userProgressRepository = userProgressRepository;
+        this.userQuizRepository = userQuizRepository;
+        this.moduleRepository = moduleRepository;
+        this.leaderboardRepository = leaderboardRepository;
+    }
+
+    @Override
+    public List<LeaderboardDTO> getAllLeaderboards() {
+        List<User> trainees = userRepository.findByRole("TRAINEE");
+        List<Module> allModules = moduleRepository.findAll();
+        List<UserProgress> allProgress = userProgressRepository.findAll();
+        List<UserQuiz> allUserQuizzes = userQuizRepository.findAll();
+
+        Map<String, Module> moduleMap = allModules.stream()
+                .collect(Collectors.toMap(Module::getId, module -> module));
+
+        Map<String, TraineeScoreData> traineeScoreMap = new HashMap<>();
+
+        // Initialize trainee score data
+        for (User trainee : trainees) {
+            traineeScoreMap.put(trainee.getId(), new TraineeScoreData(trainee.getId(), trainee.getUsername()));
+        }
+
+        // Calculate scores from module progress
+        for (UserProgress progress : allProgress) {
+            TraineeScoreData data = traineeScoreMap.get(progress.getUserId());
+            if (data != null) {
+                Module module = moduleMap.get(progress.getModuleId());
+                if (module != null) {
+                    data.totalModules++;
+                    if ("COMPLETED".equals(progress.getStatus())) {
+                        data.completedModules++;
+                        if (module.isMandatory()) { // Assuming Module has isMandatory field
+                            data.score += 10; // Award points for completed mandatory module
+                        }
+                    }
+                    // Update last activity
+                    if (data.lastActivity == null || (progress.getLastAccessedAt() != null
+                            && progress.getLastAccessedAt().compareTo(data.lastActivity) > 0)) {
+                        data.lastActivity = progress.getLastAccessedAt();
+                    }
+                }
+            }
+        }
+
+        // Calculate scores from quizzes
+        for (UserQuiz userQuiz : allUserQuizzes) {
+            TraineeScoreData data = traineeScoreMap.get(userQuiz.getUserId());
+            if (data != null && userQuiz.isCompleted()) { // Check if quiz is completed
+                data.score += userQuiz.getScore(); // Add quiz score directly
+                // Update last activity based on quiz completion
+                if (userQuiz.getCompletedAt() != null) { // Check if completedAt is not null
+                    LocalDateTime quizCompletedTime = LocalDateTime.parse(userQuiz.getCompletedAt(),
+                            DateTimeFormatter.ISO_DATE_TIME); // Parse String to LocalDateTime
+                    if (data.lastActivity == null || quizCompletedTime.compareTo(data.lastActivity) > 0) {
+                        data.lastActivity = quizCompletedTime;
+                    }
+                }
+            }
+        }
+
+        // Convert to DTOs and sort
+        List<LeaderboardDTO> leaderboard = traineeScoreMap.values().stream()
+                .map(data -> new LeaderboardDTO(
+                        null, // ID will be generated by MongoDB for Leaderboard collection
+                        data.userId,
+                        data.userName,
+                        data.score,
+                        data.completedModules,
+                        data.totalModules,
+                        data.lastActivity != null ? data.lastActivity.format(DateTimeFormatter.ISO_DATE_TIME) : null // Format
+                                                                                                                     // LocalDateTime
+                                                                                                                     // to
+                                                                                                                     // String
+                                                                                                                     // for
+                                                                                                                     // DTO
+                ))
+                .sorted(Comparator.comparingInt(LeaderboardDTO::getScore).reversed()
+                        .thenComparing(data -> data.getLastUpdatedAt(),
+                                Comparator.nullsLast(Comparator.reverseOrder()))) // Sort by last activity, nulls last
+                .collect(Collectors.toList());
+
+        return leaderboard;
+    }
+
+    @Override
+    public List<LeaderboardDTO> getTopLeaderboards() {
+        // Get all leaderboard entries and take the top 10
+        return getAllLeaderboards().stream()
+                .limit(10)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    public LeaderboardDTO getLeaderboardByUserId(String userId) {
+        // Get all leaderboard entries and find the one for the specific user
+        Optional<LeaderboardDTO> userLeaderboard = getAllLeaderboards().stream()
+                .filter(dto -> dto.getUserId().equals(userId))
+                .findFirst();
+
+        return userLeaderboard
+                .orElseThrow(() -> new RuntimeException("Leaderboard entry not found for user: " + userId));
+    }
+
+    // Helper class to hold trainee score data during calculation
+    private static class TraineeScoreData {
+        String userId;
+        String userName;
+        int score = 0;
+        int completedModules = 0;
+        int totalModules = 0;
+        LocalDateTime lastActivity = null;
+
+        TraineeScoreData(String userId, String userName) {
+            this.userId = userId;
+            this.userName = userName;
+        }
+    }
+
+    @Override
+    @Transactional
+    public LeaderboardDTO createOrUpdateLeaderboard(LeaderboardDTO leaderboardDTO) {
+        Optional<Leaderboard> existingLeaderboard = leaderboardRepository.findByUserId(leaderboardDTO.getUserId());
+        Leaderboard leaderboard;
+
+        if (existingLeaderboard.isPresent()) {
+            leaderboard = existingLeaderboard.get();
+            // Update existing entry
+            leaderboard.setScore(leaderboardDTO.getScore());
+            leaderboard.setCompletedModules(leaderboardDTO.getCompletedModules());
+            leaderboard.setTotalModules(leaderboardDTO.getTotalModules());
+            leaderboard.setLastUpdatedAt(LocalDateTime.now().format(DateTimeFormatter.ISO_DATE_TIME));
+        } else {
+            // Create new entry
+            leaderboard = new Leaderboard();
+            leaderboard.setUserId(leaderboardDTO.getUserId());
+            leaderboard.setUserName(leaderboardDTO.getUserName());
+            leaderboard.setScore(leaderboardDTO.getScore());
+            leaderboard.setCompletedModules(leaderboardDTO.getCompletedModules());
+            leaderboard.setTotalModules(leaderboardDTO.getTotalModules());
+            leaderboard.setLastUpdatedAt(LocalDateTime.now().format(DateTimeFormatter.ISO_DATE_TIME));
+        }
+
+        Leaderboard savedLeaderboard = leaderboardRepository.save(leaderboard);
+        return new LeaderboardDTO(
+                savedLeaderboard.getId(),
+                savedLeaderboard.getUserId(),
+                savedLeaderboard.getUserName(),
+                savedLeaderboard.getScore(),
+                savedLeaderboard.getCompletedModules(),
+                savedLeaderboard.getTotalModules(),
+                savedLeaderboard.getLastUpdatedAt());
+    }
+
+    @Override
+    public void deleteLeaderboard(String id) {
+        leaderboardRepository.deleteById(id);
+    }
+}
